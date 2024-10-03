@@ -1,9 +1,22 @@
+use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// High load threshold percentage (default: 85)
+    #[arg(short, long, default_value_t = 85)]
+    upper_threshold: u8,
+
+    /// Low load threshold percentage (default: 50)
+    #[arg(short, long, default_value_t = 50)]
+    lower_threshold: u8,
+}
 
 #[allow(dead_code)]
 struct CpuInfo {
@@ -273,7 +286,11 @@ fn online_all_cpus() -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    let args = Args::parse();
+
     println!("Starting CPU manager");
+    println!("Uppper load threshold: {}%", args.upper_threshold);
+    println!("Lower load threshold: {}%", args.lower_threshold);
     println!("Onlining all CPUs");
     online_all_cpus()?;
 
@@ -289,6 +306,9 @@ fn main() -> io::Result<()> {
         .unwrap_or((0.0, 0.0));
 
     println!("CPU0 Max/Min MHz: {:.2}/{:.2}", max_mhz, min_mhz);
+
+    let upper_threshold = (args.upper_threshold as f64 / 100.0) * (max_mhz - min_mhz) + min_mhz;
+    let lower_threshold = (args.lower_threshold as f64 / 100.0) * (max_mhz - min_mhz) + min_mhz;
 
     loop {
         topology.update_cpu_frequencies();
@@ -311,16 +331,14 @@ fn main() -> io::Result<()> {
             min_mhz, avg_mhz, max_mhz, online_count
         );
 
-        if avg_mhz > max_mhz * 0.85 + min_mhz * 0.15 {
-            // avg_mhz - min_mhz > 0.85 * (max_mhz - min_mhz)
+        if avg_mhz > upper_threshold {
             if let Some(core_to_online) = topology.select_cpu_to_online() {
                 println!("High load detected, onlining core {:?}", core_to_online);
                 let _ = topology.online_cpu_group(&core_to_online);
             } else {
                 println!("Cannot online more CPUs, already at maximum");
             }
-        } else if avg_mhz < max_mhz * 0.5 + min_mhz * 0.5 {
-            // avg_mhz - min_mhz < 0.5 * (max_mhz - min_mhz)
+        } else if avg_mhz < lower_threshold {
             if let Some(core_to_offline) = topology.select_cpu_to_offline() {
                 println!("Low load detected, offlining core {:?}", core_to_offline);
                 let _ = topology.offline_cpu_group(&core_to_offline);
