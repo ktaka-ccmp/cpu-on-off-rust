@@ -2,7 +2,7 @@
 
 ## Description
 
-This Rust program is designed to dynamically manage CPU cores based on system load. It aims to optimize power consumption by offlining cores when the system load is low and onlining them when the load increases.
+This Rust program dynamically manages CPU cores based on system load, optimizing power consumption by offlining cores during low load periods and onlining them when the load increases. It's designed to work with various x86_64 systems and adapts to different CPU configurations.
 
 ## Features
 
@@ -12,6 +12,8 @@ This Rust program is designed to dynamically manage CPU cores based on system lo
 - Respects CPU0 and always keeps it online
 - Handles thread siblings (e.g., hyperthreading) together
 - Provides real-time feedback on CPU states and actions taken
+- Onlines all available CPUs at startup for consistent initial state
+- Uses adaptive thresholds based on min and max CPU frequencies
 
 ## Requirements
 
@@ -40,29 +42,30 @@ Run the program with root privileges:
 sudo ./target/release/cpu-clk-rust
 ```
 
-The program will start managing CPU cores automatically. It will print information about its actions and the current state of the CPUs.
+The program will start by onlining all available CPUs, then begin managing CPU cores automatically. It will print information about its actions and the current state of the CPUs.
 
 ## How it Works
 
-1. On startup, the program reads the CPU topology from the sysfs filesystem.
-2. It enters a loop where it continuously:
+1. On startup, the program onlines all available CPUs.
+2. It then reads the CPU topology from the sysfs filesystem.
+3. The program enters a loop where it continuously:
    - Updates CPU frequency information
-   - Calculates average and maximum CPU frequencies
+   - Calculates average, minimum, and maximum CPU frequencies
    - Decides whether to online or offline cores based on the current load:
-     - If avg_freq > 85% of max_freq: Online all cores
-     - If avg_freq < 50% of max_freq: Offline cores, starting with the highest-numbered
+     - If avg_mhz - min_mhz > 0.85 * (max_mhz - min_mhz): Online one core
+     - If avg_mhz - min_mhz < 0.5 * (max_mhz - min_mhz): Offline one core
    - Applies the decided actions
    - Waits for 1 second before the next iteration
 
 ## Configuration
 
-The program uses hardcoded thresholds for determining high and low loads. If you want to adjust these, modify the following lines in `main()`:
+The program uses adaptive thresholds for determining high and low loads based on the minimum and maximum CPU frequencies. If you want to adjust these, modify the following lines in `main()`:
 
 ```rust
-if avg_mhz > max_mhz * 0.85 {  // High load threshold
-    // ...
-} else if avg_mhz < max_mhz * 0.5 {  // Low load threshold
-    // ...
+if avg_mhz > max_mhz * 0.85 + min_mhz * 0.15 {  // High load threshold
+            // avg_mhz - min_mhz > 0.85 * (max_mhz - min_mhz)
+} else if avg_mhz < max_mhz * 0.5 + min_mhz * 0.5 {  // Low load threshold
+            // avg_mhz - min_mhz < 0.5 * (max_mhz - min_mhz)
 }
 ```
 
