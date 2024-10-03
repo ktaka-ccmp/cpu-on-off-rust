@@ -5,7 +5,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug)]
+#[allow(dead_code)]
 struct CpuInfo {
     id: usize,
     core_id: Option<usize>,
@@ -149,6 +149,34 @@ impl SystemTopology {
         })
     }
 
+    fn select_cpu_to_online(&self) -> Option<Vec<usize>> {
+        let offline_cpus: Vec<_> = self
+            .cpus
+            .values()
+            .filter(|cpu| !cpu.online && cpu.id != 0) // Exclude CPU0
+            .collect();
+
+        if offline_cpus.is_empty() {
+            return None; // Don't online if all CPUs are already online
+        }
+
+        offline_cpus
+            .into_iter()
+            .min_by_key(|cpu| cpu.id)
+            .map(|cpu| {
+                let siblings = &cpu.thread_siblings;
+                siblings
+                    .iter()
+                    .filter(|&&sibling_id| {
+                        self.cpus
+                            .get(&sibling_id)
+                            .map_or(false, |sibling| !sibling.online)
+                    })
+                    .copied()
+                    .collect()
+            })
+    }
+
     fn offline_cpu_group(&mut self, cpu_ids: &[usize]) -> io::Result<()> {
         for &id in cpu_ids {
             if id == 0 {
@@ -172,6 +200,9 @@ impl SystemTopology {
 
     fn online_cpu_group(&mut self, cpu_ids: &[usize]) -> io::Result<()> {
         for &id in cpu_ids {
+            if id == 0 {
+                continue;
+            } // CPU0 is always online
             let path = Path::new("/sys/devices/system/cpu")
                 .join(format!("cpu{}", id))
                 .join("online");
@@ -217,10 +248,47 @@ impl SystemTopology {
     }
 }
 
+fn online_all_cpus() -> io::Result<()> {
+    let cpu_dir = Path::new("/sys/devices/system/cpu");
+    for entry in fs::read_dir(cpu_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(cpu_name) = path.file_name().and_then(|n| n.to_str()) {
+            if cpu_name.starts_with("cpu") && cpu_name[3..].parse::<usize>().is_ok() {
+                let id: usize = cpu_name[3..].parse().unwrap();
+                let online_path = path.join("online");
+                if id == 0 {
+                    continue;
+                } // Skip CPU0 since it's always online
+                if online_path.exists() {
+                    fs::write(&online_path, "1")?;
+                    println!("Onlined CPU {}", id);
+                } else {
+                    println!("Cannot online CPU {}: 'online' file does not exist", id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     println!("Starting CPU manager");
+    println!("Onlining all CPUs");
+    online_all_cpus()?;
+
     let mut topology = SystemTopology::new()?;
     topology.print_summary();
+
+    let (max_mhz, min_mhz) = topology
+        .cpus
+        .values()
+        .filter(|cpu| cpu.id == 0)
+        .map(|cpu| (cpu.max_mhz, cpu.min_mhz))
+        .next()
+        .unwrap_or((0.0, 0.0));
+
+    println!("CPU0 Max/Min MHz: {:.2}/{:.2}", max_mhz, min_mhz);
 
     loop {
         topology.update_cpu_frequencies();
@@ -237,24 +305,22 @@ fn main() -> io::Result<()> {
         } else {
             0.0
         };
-        let max_mhz = topology
-            .cpus
-            .values()
-            .filter(|cpu| cpu.online)
-            .map(|cpu| cpu.max_mhz)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(0.0);
 
         println!(
-            "Average CPU MHz: {:.2}, Max CPU MHz: {:.2}, Online CPUs: {}",
-            avg_mhz, max_mhz, online_count
+            "Min-Average-Max CPU MHz: {:.2}-{:.2}-{:.2}, Online CPUs: {}",
+            min_mhz, avg_mhz, max_mhz, online_count
         );
 
-        if avg_mhz > max_mhz * 0.85 {
-            println!("High load detected, onlining all CPUs");
-            let all_cpus: Vec<usize> = topology.cpus.keys().cloned().collect();
-            let _ = topology.online_cpu_group(&all_cpus);
-        } else if avg_mhz < max_mhz * 0.5 {
+        if avg_mhz > max_mhz * 0.85 + min_mhz * 0.15 {
+            // avg_mhz - min_mhz > 0.85 * (max_mhz - min_mhz)
+            if let Some(core_to_online) = topology.select_cpu_to_online() {
+                println!("High load detected, onlining core {:?}", core_to_online);
+                let _ = topology.online_cpu_group(&core_to_online);
+            } else {
+                println!("Cannot online more CPUs, already at maximum");
+            }
+        } else if avg_mhz < max_mhz * 0.5 + min_mhz * 0.5 {
+            // avg_mhz - min_mhz < 0.5 * (max_mhz - min_mhz)
             if let Some(core_to_offline) = topology.select_cpu_to_offline() {
                 println!("Low load detected, offlining core {:?}", core_to_offline);
                 let _ = topology.offline_cpu_group(&core_to_offline);
