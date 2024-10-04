@@ -4,16 +4,16 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// High load threshold percentage (default: 85)
-    #[arg(short, long, default_value_t = 85)]
+    /// Upper load threshold percentage (default: 85)
+    #[arg(short = 'u', long, default_value_t = 85)]
     upper_threshold: u8,
 
-    /// Low load threshold percentage (default: 50)
+    /// Lower load threshold percentage (default: 50)
     #[arg(short, long, default_value_t = 50)]
     lower_threshold: u8,
 }
@@ -24,16 +24,16 @@ struct CpuInfo {
     core_id: Option<usize>,
     socket_id: Option<usize>,
     thread_siblings: Vec<usize>,
-    mhz: f64,
-    max_mhz: f64,
-    min_mhz: f64,
+    c0_percentage: f64,
     online: bool,
+    last_total_idle_time: u64,
 }
 
 struct SystemTopology {
     cpus: HashMap<usize, CpuInfo>,
     sockets: HashMap<usize, Vec<usize>>,
     cpu0_socket: Option<usize>,
+    last_update: Instant,
 }
 
 impl SystemTopology {
@@ -62,8 +62,6 @@ impl SystemTopology {
 
                     let thread_siblings = Self::read_thread_siblings(&path);
 
-                    let (mhz, max_mhz, min_mhz) = Self::read_cpu_freq(&path);
-
                     let online = Self::is_cpu_online(&path);
 
                     if id == 0 {
@@ -75,10 +73,9 @@ impl SystemTopology {
                         core_id,
                         socket_id,
                         thread_siblings,
-                        mhz,
-                        max_mhz,
-                        min_mhz,
+                        c0_percentage: 0.0,
                         online,
+                        last_total_idle_time: 0,
                     };
                     cpus.insert(id, cpu_info);
 
@@ -96,6 +93,7 @@ impl SystemTopology {
             cpus,
             sockets,
             cpu0_socket,
+            last_update: Instant::now(),
         })
     }
 
@@ -104,26 +102,6 @@ impl SystemTopology {
         fs::read_to_string(&siblings_path)
             .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
             .unwrap_or_default()
-    }
-
-    fn read_cpu_freq(cpu_path: &Path) -> (f64, f64, f64) {
-        let freq_dir = cpu_path.join("cpufreq");
-        let cur_freq = fs::read_to_string(freq_dir.join("scaling_cur_freq"))
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .unwrap_or(0.0)
-            / 1000.0;
-        let max_freq = fs::read_to_string(freq_dir.join("scaling_max_freq"))
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .unwrap_or(0.0)
-            / 1000.0;
-        let min_freq = fs::read_to_string(freq_dir.join("scaling_min_freq"))
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .unwrap_or(0.0)
-            / 1000.0;
-        (cur_freq, max_freq, min_freq)
     }
 
     fn is_cpu_online(cpu_path: &Path) -> bool {
@@ -135,6 +113,42 @@ impl SystemTopology {
         } else {
             true // CPU is always online if the 'online' file doesn't exist
         }
+    }
+
+    fn update_c0_percentages(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        let actual_interval = now.duration_since(self.last_update);
+        self.last_update = now;
+
+        for cpu in self.cpus.values_mut() {
+            if cpu.online {
+                let cpuidle_path = Path::new("/sys/devices/system/cpu")
+                    .join(format!("cpu{}", cpu.id))
+                    .join("cpuidle");
+
+                let mut total_idle_time = 0;
+
+                for state in 0..4 {
+                    // Assuming 4 C-states (C0 to C3)
+                    let state_path = cpuidle_path.join(format!("state{}", state));
+                    if state_path.exists() {
+                        let time = fs::read_to_string(state_path.join("time"))?
+                            .trim()
+                            .parse::<u64>()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        total_idle_time += time;
+                    }
+                }
+
+                let idle_time_delta = total_idle_time.saturating_sub(cpu.last_total_idle_time);
+                cpu.last_total_idle_time = total_idle_time;
+
+                cpu.c0_percentage =
+                    100.0 * (1.0 - (idle_time_delta as f64 / actual_interval.as_micros() as f64));
+                cpu.c0_percentage = cpu.c0_percentage.clamp(0.0, 100.0); // Clamp between 0 and 100
+            }
+        }
+        Ok(())
     }
 
     fn select_cpu_to_offline(&self) -> Option<Vec<usize>> {
@@ -232,18 +246,6 @@ impl SystemTopology {
         Ok(())
     }
 
-    fn update_cpu_frequencies(&mut self) {
-        for cpu in self.cpus.values_mut() {
-            if cpu.online {
-                let cpu_path = Path::new("/sys/devices/system/cpu").join(format!("cpu{}", cpu.id));
-                let (mhz, max_mhz, min_mhz) = Self::read_cpu_freq(&cpu_path);
-                cpu.mhz = mhz;
-                cpu.max_mhz = max_mhz;
-                cpu.min_mhz = min_mhz;
-            }
-        }
-    }
-
     fn print_summary(&self) {
         println!("System Topology Summary:");
         println!("Total CPUs: {}", self.cpus.len());
@@ -289,7 +291,7 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
 
     println!("Starting CPU manager");
-    println!("Uppper load threshold: {}%", args.upper_threshold);
+    println!("Upper load threshold: {}%", args.upper_threshold);
     println!("Lower load threshold: {}%", args.lower_threshold);
     println!("Onlining all CPUs");
     online_all_cpus()?;
@@ -297,48 +299,35 @@ fn main() -> io::Result<()> {
     let mut topology = SystemTopology::new()?;
     topology.print_summary();
 
-    let (max_mhz, min_mhz) = topology
-        .cpus
-        .values()
-        .filter(|cpu| cpu.id == 0)
-        .map(|cpu| (cpu.max_mhz, cpu.min_mhz))
-        .next()
-        .unwrap_or((0.0, 0.0));
-
-    println!("CPU0 Max/Min MHz: {:.2}/{:.2}", max_mhz, min_mhz);
-
-    let upper_threshold = (args.upper_threshold as f64 / 100.0) * (max_mhz - min_mhz) + min_mhz;
-    let lower_threshold = (args.lower_threshold as f64 / 100.0) * (max_mhz - min_mhz) + min_mhz;
-
     loop {
-        topology.update_cpu_frequencies();
+        topology.update_c0_percentages()?;
 
-        let total_mhz: f64 = topology
+        let total_c0: f64 = topology
             .cpus
             .values()
             .filter(|cpu| cpu.online)
-            .map(|cpu| cpu.mhz)
+            .map(|cpu| cpu.c0_percentage)
             .sum();
         let online_count = topology.cpus.values().filter(|cpu| cpu.online).count();
-        let avg_mhz = if online_count > 0 {
-            total_mhz / online_count as f64
+        let avg_c0 = if online_count > 0 {
+            total_c0 / online_count as f64
         } else {
             0.0
         };
 
         println!(
-            "Min-Average-Max CPU MHz: {:.2}-{:.2}-{:.2}, Online CPUs: {}",
-            min_mhz, avg_mhz, max_mhz, online_count
+            "Average C0 state percentage: {:.2}%, Online CPUs: {}",
+            avg_c0, online_count
         );
 
-        if avg_mhz > upper_threshold {
+        if avg_c0 > args.upper_threshold as f64 {
             if let Some(core_to_online) = topology.select_cpu_to_online() {
                 println!("High load detected, onlining core {:?}", core_to_online);
                 let _ = topology.online_cpu_group(&core_to_online);
             } else {
                 println!("Cannot online more CPUs, already at maximum");
             }
-        } else if avg_mhz < lower_threshold {
+        } else if avg_c0 < args.lower_threshold as f64 {
             if let Some(core_to_offline) = topology.select_cpu_to_offline() {
                 println!("Low load detected, offlining core {:?}", core_to_offline);
                 let _ = topology.offline_cpu_group(&core_to_offline);
