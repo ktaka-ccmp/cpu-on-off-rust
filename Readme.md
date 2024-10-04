@@ -37,8 +37,8 @@ Using C0 state percentage is one approach to estimating CPU utilization. It may 
 
 1. Clone this repository:
    ```
-   git clone https://github.com/ktaka-ccmp/cpu-clk-rust.git
-   cd cpu-clk-rust
+   git clone https://github.com/ktaka-ccmp/cpu-on-off-rust.git
+   cd cpu-on-off-rust
    ```
 
 2. Build the project:
@@ -51,7 +51,7 @@ Using C0 state percentage is one approach to estimating CPU utilization. It may 
 Run the program with root privileges:
 
 ```
-sudo ./target/release/cpu-clk-rust [OPTIONS]
+sudo ./target/release/cpu-on-off-rust [OPTIONS]
 ```
 
 Options:
@@ -60,7 +60,7 @@ Options:
 
 Example:
 ```
-sudo ./target/release/cpu-clk-rust -u 80 -l 40
+sudo ./target/release/cpu-on-off-rust -u 80 -l 40
 ```
 
 ## How it Works
@@ -84,7 +84,7 @@ This program modifies CPU states and can affect system performance. Use with car
 
 ## Contributing
 
-Contributions, issues, and feature requests are welcome. Feel free to check [issues page](https://github.com/ktaka-ccmp/cpu-clk-rust/issues) if you want to contribute.
+Contributions, issues, and feature requests are welcome. Feel free to check [issues page](https://github.com/ktaka-ccmp/cpu-on-off-rust/issues) if you want to contribute.
 
 ## License
 
