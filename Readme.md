@@ -1,21 +1,31 @@
-# Dynamic C-state CPU Core Management Program
+# CPU Core Management Program Using C0 State Residency
 
 ## Description
 
-This Rust program dynamically manages CPU cores based on system load, optimizing power consumption by offlining cores during low load periods and onlining them when the load increases. It's designed to work with various x86_64 systems, adapts to different CPU configurations, and dynamically detects available C-states for each CPU.
+This Rust program dynamically manages CPU cores based on system load, aiming to optimize power consumption by offlining cores during low load periods and onlining them when the load increases. It uses the percentage of time CPUs spend in the C0 state (active state) as one way to estimate system activity.
+
+## Key Concept: C0 State and CPU Activity
+
+The program uses the C0 state percentage as an indicator of system activity. Here's a brief explanation:
+
+- C0 State: This is the CPU's active state where it's executing instructions.
+- Other C-states (C1, C2, C3, etc.): These are various sleep states where the CPU consumes less power.
+- C0 State Percentage: The proportion of time a CPU spends in the C0 state.
+  - Higher C0 percentage generally indicates more CPU activity
+  - Lower C0 percentage generally indicates less CPU activity
+
+Using C0 state percentage is one approach to estimating CPU utilization. It may offer insights into CPU activity that complement other metrics like clock speed or traditional load averages.
 
 ## Features
 
-- Automatically detects and maps the CPU topology of the system
-- Dynamically identifies available C-states for each CPU
-- Continuously monitors CPU utilization based on C-state residency
-- Dynamically offlines and onlines CPU cores based on system load
-- Respects CPU0 and always keeps it online
+- Detects available C-states for each CPU
+- Calculates C0 state percentage
+- Monitors system activity based on average C0 state percentage
+- Dynamically offlines and onlines CPU cores based on the calculated metric
+- Keeps CPU0 always online
 - Handles thread siblings (e.g., hyperthreading) together
-- Provides real-time feedback on CPU states and actions taken
-- Onlines all available CPUs at startup for consistent initial state
-- Uses adaptive thresholds based on C0 (active state) residency
-- Allows customization of high and low load thresholds via command-line arguments
+- Provides feedback on CPU states and actions taken
+- Allows customization of thresholds via command-line arguments
 
 ## Requirements
 
@@ -45,31 +55,28 @@ sudo ./target/release/cpu-clk-rust [OPTIONS]
 ```
 
 Options:
-- `-u, --upper-threshold <VALUE>`: Set the upper load threshold percentage (default: 85)
-- `-l, --lower-threshold <VALUE>`: Set the lower load threshold percentage (default: 50)
+- `-u, --upper-threshold <VALUE>`: Set the upper C0 percentage threshold (default: 85)
+- `-l, --lower-threshold <VALUE>`: Set the lower C0 percentage threshold (default: 50)
 
 Example:
 ```
 sudo ./target/release/cpu-clk-rust -u 80 -l 40
 ```
 
-The program will start by onlining all available CPUs, then begin managing CPU cores automatically based on the specified thresholds. It will print information about its actions and the current state of the CPUs.
-
 ## How it Works
 
-1. On startup, the program parses command-line arguments for custom thresholds.
-2. It then onlines all available CPUs and reads the CPU topology from the sysfs filesystem.
-3. The program detects available C-states for each CPU.
-4. It enters a loop where it continuously:
-   - Updates C-state residency information for each CPU
-   - Calculates the average C0 (active state) percentage across all online CPUs
-   - Decides whether to online or offline cores based on the current load and specified thresholds
-   - Applies the decided actions
-   - Waits for 1 second before the next iteration
+1. The program detects CPUs and their available C-states.
+2. It then enters a loop where it:
+   - Calculates the C0 state percentage for each CPU.
+   - Computes the average C0 percentage across all online CPUs.
+   - Based on this average and the set thresholds, it may online or offline cores.
+   - Waits for a short interval before the next iteration.
 
-## Configuration
-
-The upper and lower load thresholds can be configured via command-line arguments. If not specified, the program uses default values of 85% for the upper threshold and 50% for the lower threshold.
+3. The C0 percentage is calculated as:
+   ```
+   C0_percentage = 100 * (1 - (idle_time / total_time))
+   ```
+   Where `idle_time` is the sum of time spent in all C-states except C0, and `total_time` is the total elapsed time.
 
 ## Caution
 
@@ -85,10 +92,10 @@ Contributions, issues, and feature requests are welcome. Feel free to check [iss
 
 ## Author
 
-[Kimitoshi Takahashi]
+[Your Name]
 
 ## Acknowledgments
 
-- Inspired by CPU management techniques in modern operating systems
-- Thanks to the Rust community for providing excellent documentation and libraries
+- Inspired by various CPU management techniques
+- Thanks to the Rust community for their libraries and documentation
 - Uses the `clap` crate for parsing command-line arguments
