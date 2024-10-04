@@ -92,7 +92,7 @@ Contributions, issues, and feature requests are welcome. Feel free to check [iss
 
 ## Author
 
-[Your Name]
+[Kimitoshi Takahashi](https://github.com/ktaka-ccmp)
 
 ## Acknowledgments
 
