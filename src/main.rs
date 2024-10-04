@@ -14,7 +14,7 @@ struct Args {
     upper_threshold: u8,
 
     /// Lower load threshold percentage (default: 50)
-    #[arg(short, long, default_value_t = 50)]
+    #[arg(short = 'l', long, default_value_t = 50)]
     lower_threshold: u8,
 }
 
@@ -27,6 +27,7 @@ struct CpuInfo {
     c0_percentage: f64,
     online: bool,
     last_total_idle_time: u64,
+    idle_states: Vec<String>,
 }
 
 struct SystemTopology {
@@ -64,6 +65,8 @@ impl SystemTopology {
 
                     let online = Self::is_cpu_online(&path);
 
+                    let idle_states = Self::get_idle_states(&path);
+
                     if id == 0 {
                         cpu0_socket = socket_id;
                     }
@@ -76,6 +79,7 @@ impl SystemTopology {
                         c0_percentage: 0.0,
                         online,
                         last_total_idle_time: 0,
+                        idle_states,
                     };
                     cpus.insert(id, cpu_info);
 
@@ -115,6 +119,22 @@ impl SystemTopology {
         }
     }
 
+    fn get_idle_states(cpu_path: &Path) -> Vec<String> {
+        let cpuidle_path = cpu_path.join("cpuidle");
+        let mut states = Vec::new();
+        if let Ok(entries) = fs::read_dir(cpuidle_path) {
+            for entry in entries.filter_map(Result::ok) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("state") {
+                        states.push(name.to_string());
+                    }
+                }
+            }
+        }
+        states.sort();
+        states
+    }
+
     fn update_c0_percentages(&mut self) -> io::Result<()> {
         let now = Instant::now();
         let actual_interval = now.duration_since(self.last_update);
@@ -128,9 +148,8 @@ impl SystemTopology {
 
                 let mut total_idle_time = 0;
 
-                for state in 0..4 {
-                    // Assuming 4 C-states (C0 to C3)
-                    let state_path = cpuidle_path.join(format!("state{}", state));
+                for state in &cpu.idle_states {
+                    let state_path = cpuidle_path.join(state);
                     if state_path.exists() {
                         let time = fs::read_to_string(state_path.join("time"))?
                             .trim()
@@ -259,6 +278,11 @@ impl SystemTopology {
                 .filter(|&&cpu_id| self.cpus[&cpu_id].online)
                 .count();
             println!("  Online CPUs: {}", online_cpus);
+        }
+
+        // Print idle states for CPU0 as an example
+        if let Some(cpu0) = self.cpus.get(&0) {
+            println!("Idle states for CPU0: {:?}", cpu0.idle_states);
         }
     }
 }
