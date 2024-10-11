@@ -1,10 +1,12 @@
 use clap::Parser;
 use std::collections::HashMap;
-use std::fs;
 use std::io;
 use std::path::Path;
-use std::thread;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tokio::fs;
+
+static CPU_DIR: &str = "/sys/devices/system/cpu";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -19,6 +21,7 @@ struct Args {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 struct CpuInfo {
     id: usize,
     core_id: Option<usize>,
@@ -38,56 +41,17 @@ struct SystemTopology {
 }
 
 impl SystemTopology {
-    fn new() -> io::Result<Self> {
+    async fn new() -> io::Result<Self> {
         let mut cpus = HashMap::new();
         let mut sockets = HashMap::new();
         let mut cpu0_socket = None;
 
-        let cpu_dir = Path::new("/sys/devices/system/cpu");
+        let cpu_dir = Path::new(CPU_DIR);
         println!("Reading CPU information from: {:?}", cpu_dir);
-        for entry in fs::read_dir(cpu_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if let Some(cpu_name) = path.file_name().and_then(|n| n.to_str()) {
-                if cpu_name.starts_with("cpu") && cpu_name[3..].parse::<usize>().is_ok() {
-                    let id = cpu_name[3..].parse().unwrap();
-                    println!("Processing CPU {}", id);
 
-                    let core_id = fs::read_to_string(path.join("topology/core_id"))
-                        .ok()
-                        .and_then(|s| s.trim().parse().ok());
-
-                    let socket_id = fs::read_to_string(path.join("topology/physical_package_id"))
-                        .ok()
-                        .and_then(|s| s.trim().parse().ok());
-
-                    let thread_siblings = Self::read_thread_siblings(&path);
-
-                    let online = Self::is_cpu_online(&path);
-
-                    let idle_states = Self::get_idle_states(&path);
-
-                    if id == 0 {
-                        cpu0_socket = socket_id;
-                    }
-
-                    let cpu_info = CpuInfo {
-                        id,
-                        core_id,
-                        socket_id,
-                        thread_siblings,
-                        c0_percentage: 0.0,
-                        online,
-                        last_total_idle_time: 0,
-                        idle_states,
-                    };
-                    cpus.insert(id, cpu_info);
-
-                    if let Some(socket_id) = socket_id {
-                        sockets.entry(socket_id).or_insert_with(Vec::new).push(id);
-                    }
-                }
-            }
+        let mut read_dir = fs::read_dir(cpu_dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            Self::process_cpu(entry, &mut cpu0_socket, &mut cpus, &mut sockets).await;
         }
 
         println!("Finished reading CPU information");
@@ -101,17 +65,71 @@ impl SystemTopology {
         })
     }
 
-    fn read_thread_siblings(cpu_path: &Path) -> Vec<usize> {
+    async fn process_cpu(
+        entry: fs::DirEntry,
+        cpu0_socket: &mut Option<usize>,
+        cpus: &mut HashMap<usize, CpuInfo>,
+        sockets: &mut HashMap<usize, Vec<usize>>,
+    ) {
+        let path = entry.path();
+        if let Some(cpu_name) = path.file_name().and_then(|n| n.to_str()) {
+            if cpu_name.starts_with("cpu") && cpu_name[3..].parse::<usize>().is_ok() {
+                let id = cpu_name[3..].parse().unwrap();
+                println!("Processing CPU {}", id);
+
+                let core_id = fs::read_to_string(path.join("topology/core_id"))
+                    .await
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok());
+
+                let socket_id = fs::read_to_string(path.join("topology/physical_package_id"))
+                    .await
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok());
+
+                let thread_siblings = Self::read_thread_siblings(&path).await;
+
+                let online = Self::is_cpu_online(&path).await;
+
+                let idle_states = Self::get_idle_states(&path).await;
+
+                if id == 0 {
+                    *cpu0_socket = socket_id;
+                }
+
+                let cpu_info = CpuInfo {
+                    id,
+                    core_id,
+                    socket_id,
+                    thread_siblings,
+                    c0_percentage: 0.0,
+                    online,
+                    last_total_idle_time: 0,
+                    idle_states,
+                };
+                cpus.insert(id, cpu_info);
+
+                if let Some(socket_id) = socket_id {
+                    sockets.entry(socket_id).or_default().push(id);
+                    // sockets.entry(socket_id).or_insert_with(Vec::new).push(id);
+                }
+            }
+        }
+    }
+
+    async fn read_thread_siblings(cpu_path: &Path) -> Vec<usize> {
         let siblings_path = cpu_path.join("topology/thread_siblings_list");
         fs::read_to_string(&siblings_path)
+            .await
             .map(|s| s.split(',').filter_map(|n| n.trim().parse().ok()).collect())
             .unwrap_or_default()
     }
 
-    fn is_cpu_online(cpu_path: &Path) -> bool {
+    async fn is_cpu_online(cpu_path: &Path) -> bool {
         let online_path = cpu_path.join("online");
         if online_path.exists() {
             fs::read_to_string(online_path)
+                .await
                 .map(|content| content.trim() == "1")
                 .unwrap_or(false)
         } else {
@@ -119,11 +137,11 @@ impl SystemTopology {
         }
     }
 
-    fn get_idle_states(cpu_path: &Path) -> Vec<String> {
+    async fn get_idle_states(cpu_path: &Path) -> Vec<String> {
         let cpuidle_path = cpu_path.join("cpuidle");
         let mut states = Vec::new();
-        if let Ok(entries) = fs::read_dir(cpuidle_path) {
-            for entry in entries.filter_map(Result::ok) {
+        if let Ok(mut entries) = fs::read_dir(cpuidle_path).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.starts_with("state") {
                         states.push(name.to_string());
@@ -135,38 +153,43 @@ impl SystemTopology {
         states
     }
 
-    fn update_c0_percentages(&mut self) -> io::Result<()> {
+    async fn update_c0_percentages(&mut self) -> io::Result<()> {
         let now = Instant::now();
         let actual_interval = now.duration_since(self.last_update);
         self.last_update = now;
 
         for cpu in self.cpus.values_mut() {
             if cpu.online {
-                let cpuidle_path = Path::new("/sys/devices/system/cpu")
-                    .join(format!("cpu{}", cpu.id))
-                    .join("cpuidle");
-
-                let mut total_idle_time = 0;
-
-                for state in &cpu.idle_states {
-                    let state_path = cpuidle_path.join(state);
-                    if state_path.exists() {
-                        let time = fs::read_to_string(state_path.join("time"))?
-                            .trim()
-                            .parse::<u64>()
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                        total_idle_time += time;
-                    }
-                }
-
-                let idle_time_delta = total_idle_time.saturating_sub(cpu.last_total_idle_time);
-                cpu.last_total_idle_time = total_idle_time;
-
-                cpu.c0_percentage =
-                    100.0 * (1.0 - (idle_time_delta as f64 / actual_interval.as_micros() as f64));
-                cpu.c0_percentage = cpu.c0_percentage.clamp(0.0, 100.0); // Clamp between 0 and 100
+                Self::update_c0_single(cpu, actual_interval).await?;
             }
         }
+        Ok(())
+    }
+
+    async fn update_c0_single(
+        cpu: &mut CpuInfo,
+        actual_interval: Duration,
+    ) -> Result<(), io::Error> {
+        let cpuidle_path = Path::new(CPU_DIR)
+            .join(format!("cpu{}", cpu.id))
+            .join("cpuidle");
+        let mut total_idle_time = 0;
+        for state in &cpu.idle_states {
+            let state_path = cpuidle_path.join(state);
+            if state_path.exists() {
+                let time = fs::read_to_string(state_path.join("time"))
+                    .await?
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                total_idle_time += time;
+            }
+        }
+        let idle_time_delta = total_idle_time.saturating_sub(cpu.last_total_idle_time);
+        cpu.last_total_idle_time = total_idle_time;
+        cpu.c0_percentage =
+            100.0 * (1.0 - (idle_time_delta as f64 / actual_interval.as_micros() as f64));
+        cpu.c0_percentage = cpu.c0_percentage.clamp(0.0, 100.0);
         Ok(())
     }
 
@@ -223,16 +246,14 @@ impl SystemTopology {
             })
     }
 
-    fn offline_cpu_group(&mut self, cpu_ids: &[usize]) -> io::Result<()> {
+    async fn offline_cpu_group(&mut self, cpu_ids: &[usize]) -> io::Result<()> {
         for &id in cpu_ids {
             if id == 0 {
                 continue;
             } // Never offline CPU0
-            let path = Path::new("/sys/devices/system/cpu")
-                .join(format!("cpu{}", id))
-                .join("online");
+            let path = Path::new(CPU_DIR).join(format!("cpu{}", id)).join("online");
             if path.exists() {
-                fs::write(&path, "0")?;
+                fs::write(&path, "0").await?;
                 if let Some(cpu) = self.cpus.get_mut(&id) {
                     cpu.online = false;
                 }
@@ -244,16 +265,14 @@ impl SystemTopology {
         Ok(())
     }
 
-    fn online_cpu_group(&mut self, cpu_ids: &[usize]) -> io::Result<()> {
+    async fn online_cpu_group(&mut self, cpu_ids: &[usize]) -> io::Result<()> {
         for &id in cpu_ids {
             if id == 0 {
                 continue;
             } // CPU0 is always online
-            let path = Path::new("/sys/devices/system/cpu")
-                .join(format!("cpu{}", id))
-                .join("online");
+            let path = Path::new(CPU_DIR).join(format!("cpu{}", id)).join("online");
             if path.exists() {
-                fs::write(&path, "1")?;
+                fs::write(&path, "1").await?;
                 if let Some(cpu) = self.cpus.get_mut(&id) {
                     cpu.online = true;
                 }
@@ -287,10 +306,10 @@ impl SystemTopology {
     }
 }
 
-fn online_all_cpus() -> io::Result<()> {
-    let cpu_dir = Path::new("/sys/devices/system/cpu");
-    for entry in fs::read_dir(cpu_dir)? {
-        let entry = entry?;
+async fn online_all_cpus() -> io::Result<()> {
+    let cpu_dir = Path::new(CPU_DIR);
+    let mut read_dir = fs::read_dir(cpu_dir).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
         let path = entry.path();
         if let Some(cpu_name) = path.file_name().and_then(|n| n.to_str()) {
             if cpu_name.starts_with("cpu") && cpu_name[3..].parse::<usize>().is_ok() {
@@ -300,7 +319,7 @@ fn online_all_cpus() -> io::Result<()> {
                     continue;
                 } // Skip CPU0 since it's always online
                 if online_path.exists() {
-                    fs::write(&online_path, "1")?;
+                    fs::write(&online_path, "1").await?;
                     println!("Onlined CPU {}", id);
                 } else {
                     println!("Cannot online CPU {}: 'online' file does not exist", id);
@@ -311,20 +330,33 @@ fn online_all_cpus() -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("Starting CPU manager");
     println!("Upper load threshold: {}%", args.upper_threshold);
     println!("Lower load threshold: {}%", args.lower_threshold);
     println!("Onlining all CPUs");
-    online_all_cpus()?;
+    online_all_cpus().await?;
 
-    let mut topology = SystemTopology::new()?;
+    let mut topology = SystemTopology::new().await?;
     topology.print_summary();
 
+    let (tx, rx) = mpsc::channel();
+
+    ctrlc::set_handler(move || tx.send("hello").expect("Could not send signal on channel."))?;
+
     loop {
-        topology.update_c0_percentages()?;
+        if let Ok(msg) = rx.try_recv() {
+            // if rx.try_recv().is_ok() {
+            println!("Received shutdown signal. Cleaning up...{}", msg);
+            online_all_cpus().await?;
+            println!("All CPUs onlined. Shutting down.");
+            return Ok(());
+        }
+
+        topology.update_c0_percentages().await?;
 
         let total_c0: f64 = topology
             .cpus
@@ -347,14 +379,14 @@ fn main() -> io::Result<()> {
         if avg_c0 > args.upper_threshold as f64 {
             if let Some(core_to_online) = topology.select_cpu_to_online() {
                 println!("High load detected, onlining core {:?}", core_to_online);
-                let _ = topology.online_cpu_group(&core_to_online);
+                let _ = topology.online_cpu_group(&core_to_online).await;
             } else {
                 println!("Cannot online more CPUs, already at maximum");
             }
         } else if avg_c0 < args.lower_threshold as f64 {
             if let Some(core_to_offline) = topology.select_cpu_to_offline() {
                 println!("Low load detected, offlining core {:?}", core_to_offline);
-                let _ = topology.offline_cpu_group(&core_to_offline);
+                let _ = topology.offline_cpu_group(&core_to_offline).await;
             } else {
                 println!("Cannot offline more CPUs, already at minimum");
             }
@@ -362,6 +394,6 @@ fn main() -> io::Result<()> {
             println!("Load is optimal, no action needed");
         }
 
-        thread::sleep(Duration::from_secs(1));
+        let _ = tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
