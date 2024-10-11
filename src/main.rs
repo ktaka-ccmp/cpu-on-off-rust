@@ -1,8 +1,10 @@
 use clap::Parser;
+use ctrlc;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -311,7 +313,7 @@ fn online_all_cpus() -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("Starting CPU manager");
@@ -323,7 +325,19 @@ fn main() -> io::Result<()> {
     let mut topology = SystemTopology::new()?;
     topology.print_summary();
 
+    let (tx, rx) = mpsc::channel();
+
+    ctrlc::set_handler(move || tx.send("hello").expect("Could not send signal on channel."))?;
+
     loop {
+        if let Ok(msg) = rx.try_recv() {
+        // if rx.try_recv().is_ok() {
+            println!("Received shutdown signal. Cleaning up...{}", msg);
+            online_all_cpus()?;
+            println!("All CPUs onlined. Shutting down.");
+            return Ok(());
+        }
+
         topology.update_c0_percentages()?;
 
         let total_c0: f64 = topology
