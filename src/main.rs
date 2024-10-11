@@ -2,9 +2,10 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::fs;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::watch;
 
 static CPU_DIR: &str = "/sys/devices/system/cpu";
 
@@ -330,30 +331,53 @@ async fn online_all_cpus() -> io::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+async fn signal_handler(tx: watch::Sender<bool>) {
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let mut sighup = signal(SignalKind::hangup()).unwrap();
 
-    println!("Starting CPU manager");
-    println!("Upper load threshold: {}%", args.upper_threshold);
-    println!("Lower load threshold: {}%", args.lower_threshold);
-    println!("Onlining all CPUs");
-    online_all_cpus().await?;
-
-    let mut topology = SystemTopology::new().await?;
-    topology.print_summary();
-
-    let (tx, rx) = mpsc::channel();
-
-    ctrlc::set_handler(move || tx.send("hello").expect("Could not send signal on channel."))?;
+    let mut flag = false;
 
     loop {
-        if let Ok(msg) = rx.try_recv() {
-            // if rx.try_recv().is_ok() {
-            println!("Received shutdown signal. Cleaning up...{}", msg);
+        tokio::select! {
+            _ = sigint.recv() => {
+                println!("Received SIGINT");
+                online_all_cpus().await.unwrap();
+                break;
+            }
+            _ = sigterm.recv() => {
+                println!("Received SIGTERM");
+                online_all_cpus().await.unwrap();
+                break;
+            }
+            _ = sighup.recv() => {
+                println!("Received SIGHUP");
+                flag = !flag;
+                tx.send(flag).unwrap();
+            }
+        }
+    }
+
+    // Cleanup code here
+    println!("Shutting down...");
+}
+
+async fn cpu_manager(
+    args: &Args,
+    topology: &mut SystemTopology,
+    rx: watch::Receiver<bool>,
+) -> io::Result<()> {
+    loop {
+        if *rx.borrow() {
+            println!("Received HUP signal...");
             online_all_cpus().await?;
-            println!("All CPUs onlined. Shutting down.");
-            return Ok(());
+            println!("Send Hup signal to restart...");
+            loop {
+                if !*rx.borrow() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
 
         topology.update_c0_percentages().await?;
@@ -396,4 +420,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let _ = tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    println!("Starting CPU manager");
+    println!("Upper load threshold: {}%", args.upper_threshold);
+    println!("Lower load threshold: {}%", args.lower_threshold);
+    println!("Onlining all CPUs");
+    online_all_cpus().await?;
+
+    let mut topology = SystemTopology::new().await?;
+    topology.print_summary();
+
+    let (tx, rx) = watch::channel(false);
+
+    let main_task = tokio::spawn(async move { cpu_manager(&args, &mut topology, rx).await });
+
+    let signal_task = tokio::spawn(signal_handler(tx));
+
+    tokio::select! {
+        _ = main_task => println!("Main task completed"),
+        _ = signal_task => println!("Received shutdown signal"),
+    }
+
+    Ok(())
 }

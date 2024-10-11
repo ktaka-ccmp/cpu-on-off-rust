@@ -2,30 +2,19 @@
 
 ## Description
 
-This Rust program dynamically manages CPU cores based on system load, aiming to optimize power consumption by offlining cores during low load periods and onlining them when the load increases. It uses the percentage of time CPUs spend in the C0 state (active state) as one way to estimate system activity.
-
-## Key Concept: C0 State and CPU Activity
-
-The program uses the C0 state percentage as an indicator of system activity. Here's a brief explanation:
-
-- C0 State: This is the CPU's active state where it's executing instructions.
-- Other C-states (C1, C2, C3, etc.): These are various sleep states where the CPU consumes less power.
-- C0 State Percentage: The proportion of time a CPU spends in the C0 state.
-  - Higher C0 percentage generally indicates more CPU activity
-  - Lower C0 percentage generally indicates less CPU activity
-
-Using C0 state percentage is one approach to estimating CPU utilization. It may offer insights into CPU activity that complement other metrics like clock speed or traditional load averages.
+This Rust program dynamically manages CPU cores based on system load, optimizing power consumption by offlining cores during low load periods and onlining them when the load increases. It uses the percentage of time CPUs spend in the C0 state (active state) as a measure of system activity.
 
 ## Features
 
 - Detects available C-states for each CPU
-- Calculates C0 state percentage
-- Monitors system activity based on average C0 state percentage
-- Dynamically offlines and onlines CPU cores based on the calculated metric
-- Keeps CPU0 always online
+- Calculates C0 state percentage to measure CPU utilization
+- Continuously monitors system load based on average C0 state percentage
+- Dynamically offlines and onlines CPU cores based on the calculated load
+- Respects CPU0 and always keeps it online
 - Handles thread siblings (e.g., hyperthreading) together
-- Provides feedback on CPU states and actions taken
-- Allows customization of thresholds via command-line arguments
+- Provides real-time feedback on CPU states and actions taken
+- Allows customization of high and low load thresholds via command-line arguments
+- Supports graceful shutdown and restart via signal handling (SIGINT, SIGTERM, SIGHUP)
 
 ## Requirements
 
@@ -63,6 +52,33 @@ Example:
 sudo ./target/release/cpu-on-off-rust -u 80 -l 40
 ```
 
+## Signal Handling
+
+The program supports the following signals:
+
+- SIGINT (Ctrl+C) and SIGTERM: Gracefully shut down the program, onlining all CPUs before exiting.
+- SIGHUP: Restart the CPU management process. This will:
+  1. Online all CPUs
+  2. Reset the CPU topology information
+  3. Restart the CPU management loop with the same threshold settings
+
+This is useful for:
+
+- Resetting the CPU states to a known configuration.
+- Temporarily enabling all CPUs for a short period, without stopping the management program. After the SIGHUP, the program will resume the normal operation.
+
+To send a SIGHUP signal to the running program:
+
+1. Find the process ID (PID) of the running program:
+   ```
+   ps aux | grep cpu-on-off-rust
+   ```
+
+2. Send the SIGHUP signal:
+   ```
+   kill -SIGHUP <PID>
+   ```
+
 ## How it Works
 
 1. The program detects CPUs and their available C-states.
@@ -99,3 +115,4 @@ Contributions, issues, and feature requests are welcome. Feel free to check [iss
 - Inspired by various CPU management techniques
 - Thanks to the Rust community for their libraries and documentation
 - Uses the `clap` crate for parsing command-line arguments
+- Uses the `tokio` runtime for asynchronous operations and signal handling
