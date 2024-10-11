@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::task::JoinSet;
 
 static CPU_DIR: &str = "/sys/devices/system/cpu";
 
@@ -159,53 +158,12 @@ impl SystemTopology {
         let actual_interval = now.duration_since(self.last_update);
         self.last_update = now;
 
-        let mut set = JoinSet::new();
-
-        for cpu in self.cpus.values().cloned().collect::<Vec<CpuInfo>>() {
+        for cpu in self.cpus.values_mut() {
             if cpu.online {
-                set.spawn(async move {
-                    Self::calc_c0_single(&cpu, actual_interval)
-                        .await
-                        .map(|res| (cpu.id, res))
-                });
+                Self::update_c0_single(cpu, actual_interval).await?;
             }
         }
-
-        while let Some(res) = set.join_next().await {
-            let (cpu_id, result) = res??;
-            if let Some(cpu) = self.cpus.get_mut(&cpu_id) {
-                cpu.c0_percentage = result.1;
-                cpu.last_total_idle_time = result.2;
-            }
-        }
-
         Ok(())
-    }
-
-    async fn calc_c0_single(
-        cpu: &CpuInfo,
-        actual_interval: Duration,
-    ) -> io::Result<(usize, f64, u64)> {
-        let cpuidle_path = Path::new(CPU_DIR)
-            .join(format!("cpu{}", cpu.id))
-            .join("cpuidle");
-        let mut total_idle_time = 0;
-        for state in &cpu.idle_states {
-            let state_path = cpuidle_path.join(state);
-            if state_path.exists() {
-                let time = fs::read_to_string(state_path.join("time"))
-                    .await?
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                total_idle_time += time;
-            }
-        }
-        let idle_time_delta = total_idle_time.saturating_sub(cpu.last_total_idle_time);
-        let c0_percentage = 100.0
-            * (1.0 - (idle_time_delta as f64 / actual_interval.as_micros() as f64))
-                .clamp(0.0, 100.0);
-        Ok((cpu.id, c0_percentage, total_idle_time))
     }
 
     async fn update_c0_single(
