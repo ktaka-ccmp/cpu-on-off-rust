@@ -1,3 +1,36 @@
+//! This program manages CPU states (online/offline) based on system load thresholds.
+//! It uses the `clap` crate for command-line argument parsing and `tokio` for asynchronous operations.
+//!
+//! # Command-line Arguments
+//! - `-u, --upper-threshold`: Upper load threshold percentage (default: 85)
+//! - `-l, --lower-threshold`: Lower load threshold percentage (default: 50)
+//!
+//! # Structures
+//! - `Args`: Holds the command-line arguments.
+//! - `CpuInfo`: Represents information about a single CPU.
+//! - `SystemTopology`: Represents the system's CPU topology and provides methods to manage CPU states.
+//!
+//! # Methods
+//! - `SystemTopology::new()`: Initializes the system topology by reading CPU information.
+//! - `SystemTopology::process_cpu()`: Processes individual CPU entries.
+//! - `SystemTopology::read_thread_siblings()`: Reads thread siblings for a CPU.
+//! - `SystemTopology::is_cpu_online()`: Checks if a CPU is online.
+//! - `SystemTopology::get_idle_states()`: Retrieves idle states for a CPU.
+//! - `SystemTopology::update_c0_percentages()`: Updates the C0 state percentages for all CPUs.
+//! - `SystemTopology::update_c0_single()`: Updates the C0 state percentage for a single CPU.
+//! - `SystemTopology::select_cpu_to_offline()`: Selects CPUs to offline based on load.
+//! - `SystemTopology::select_cpu_to_online()`: Selects CPUs to online based on load.
+//! - `SystemTopology::offline_cpu_group()`: Offlines a group of CPUs.
+//! - `SystemTopology::online_cpu_group()`: Onlines a group of CPUs.
+//! - `SystemTopology::print_summary()`: Prints a summary of the system topology.
+//!
+//! # Functions
+//! - `online_all_cpus()`: Onlines all CPUs.
+//! - `signal_handler()`: Handles UNIX signals (SIGINT, SIGTERM, SIGHUP).
+//! - `cpu_manager()`: Manages CPU states based on load thresholds and signals.
+//!
+//! # Main Function
+//! - Initializes the program, parses command-line arguments, onlines all CPUs, initializes the system topology, and starts the CPU manager and signal handler tasks.
 use clap::Parser;
 use std::collections::HashMap;
 use std::io;
@@ -66,6 +99,23 @@ impl SystemTopology {
         })
     }
 
+    /// Asynchronously processes a CPU entry, extracting relevant information and updating the provided data structures.
+    ///
+    /// This function performs the following steps:
+    /// 1. Retrieves the path of the CPU entry.
+    /// 2. Extracts the CPU name from the path and checks if it starts with "cpu" and is followed by a valid number.
+    /// 3. Parses the CPU ID from the CPU name.
+    /// 4. Reads the core ID and socket ID from the respective files in the CPU's topology directory.
+    /// 5. Reads the thread siblings, online status, and idle states of the CPU.
+    /// 6. If the CPU ID is 0, updates the `cpu0_socket` with the socket ID.
+    /// 7. Creates a `CpuInfo` struct with the extracted information and inserts it into the `cpus` HashMap.
+    /// 8. Updates the `sockets` HashMap with the CPU ID if the socket ID is present.
+    ///
+    /// # Arguments
+    /// * `entry` - The directory entry representing the CPU.
+    /// * `cpu0_socket` - A mutable reference to an Option containing the socket ID of CPU0.
+    /// * `cpus` - A mutable reference to a HashMap storing information about all CPUs.
+    /// * `sockets` - A mutable reference to a HashMap storing the CPUs associated with each socket.
     async fn process_cpu(
         entry: fs::DirEntry,
         cpu0_socket: &mut Option<usize>,
@@ -154,6 +204,17 @@ impl SystemTopology {
         states
     }
 
+    /// Asynchronously updates the C0 state percentages (non-idle time) for all online CPUs.
+    ///
+    /// This function performs the following steps:
+    /// 1. Records the current time as `now`.
+    /// 2. Calculates the actual interval since the last update by subtracting `self.last_update` from `now`.
+    /// 3. Updates `self.last_update` to the current time.
+    /// 4. Iterates over all CPUs in the `self.cpus` HashMap.
+    /// 5. For each online CPU, calls the `update_c0_single` method to update its C0 percentage based on the actual interval.
+    ///
+    /// # Returns
+    /// * `io::Result<()>` - Returns an `Ok(())` if successful, or an `io::Error` if an error occurs.
     async fn update_c0_percentages(&mut self) -> io::Result<()> {
         let now = Instant::now();
         let actual_interval = now.duration_since(self.last_update);
@@ -167,6 +228,21 @@ impl SystemTopology {
         Ok(())
     }
 
+    /// Asynchronously updates the C0 state percentage (non-idle time) for a single CPU based on the actual interval.
+    ///
+    /// This function performs the following steps:
+    /// 1. Constructs the path to the CPU's cpuidle directory.
+    /// 2. Initializes the total idle time to zero.
+    /// 3. Iterates over the CPU's idle states and reads the idle time for each state from the respective file.
+    /// 4. Sums up the idle times to get the total idle time.
+    /// 5. Calculates the delta of idle time since the last update.
+    /// 6. Updates the CPU's last total idle time with the current total idle time.
+    /// 7. Calculates the C0 percentage as the proportion of non-idle time over the actual interval.
+    /// 8. Clamps the C0 percentage to the range [0.0, 100.0].
+    ///
+    /// # Arguments
+    /// * `cpu` - A mutable reference to the `CpuInfo` struct representing the CPU.
+    /// * `actual_interval` - The duration since the last update.
     async fn update_c0_single(
         cpu: &mut CpuInfo,
         actual_interval: Duration,
@@ -194,6 +270,17 @@ impl SystemTopology {
         Ok(())
     }
 
+    /// Selects a group of CPUs to be offlined based on their current state and topology.
+    ///
+    /// This function performs the following steps:
+    /// 1. Filters the CPUs to get a list of online CPUs excluding CPU0.
+    /// 2. If there is only one or no online CPU (excluding CPU0), returns `None` to avoid offlining.
+    /// 3. Finds the CPU with the highest ID among the online CPUs.
+    /// 4. Collects the thread siblings of the selected CPU that are also online.
+    /// 5. Returns the list of online thread siblings to be offlined.
+    ///
+    /// # Returns
+    /// * `Option<Vec<usize>>` - A vector of CPU IDs to be offlined, or `None` if no CPUs can be offlined.
     fn select_cpu_to_offline(&self) -> Option<Vec<usize>> {
         let online_cpus: Vec<_> = self
             .cpus
@@ -219,6 +306,17 @@ impl SystemTopology {
         })
     }
 
+    /// Selects a group of CPUs to be onlined based on their current state and topology.
+    ///
+    /// This function performs the following steps:
+    /// 1. Filters the CPUs to get a list of offline CPUs excluding CPU0.
+    /// 2. If all CPUs are already online, returns `None` to avoid onlining.
+    /// 3. Finds the CPU with the lowest ID among the offline CPUs.
+    /// 4. Collects the thread siblings of the selected CPU that are also offline.
+    /// 5. Returns the list of offline thread siblings to be onlined.
+    ///
+    /// # Returns
+    /// * `Option<Vec<usize>>` - A vector of CPU IDs to be onlined, or `None` if no CPUs can be onlined.
     fn select_cpu_to_online(&self) -> Option<Vec<usize>> {
         let offline_cpus: Vec<_> = self
             .cpus
@@ -331,6 +429,19 @@ async fn online_all_cpus() -> io::Result<()> {
     Ok(())
 }
 
+/// Handles UNIX signals (SIGINT, SIGTERM, SIGHUP) asynchronously.
+///
+/// This function performs the following steps:
+/// 1. Sets up signal handlers for SIGINT, SIGTERM, and SIGHUP using `tokio::signal::unix::signal`.
+/// 2. Initializes a flag to `false`.
+/// 3. Enters an infinite loop where it waits for any of the signals to be received using `tokio::select!`.
+/// 4. If SIGINT is received, it prints a message, calls `online_all_cpus` to online all CPUs, and breaks the loop.
+/// 5. If SIGTERM is received, it prints a message, calls `online_all_cpus` to online all CPUs, and breaks the loop.
+/// 6. If SIGHUP is received, it toggles the flag, sends the flag's value through the provided `watch::Sender`, and continues the loop.
+/// 7. After breaking the loop, it prints a shutdown message and performs any necessary cleanup.
+///
+/// # Arguments
+/// * `tx` - A `watch::Sender<bool>` used to send the flag's value when SIGHUP is received.
 async fn signal_handler(tx: watch::Sender<bool>) {
     let mut sigint = signal(SignalKind::interrupt()).unwrap();
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
@@ -362,6 +473,26 @@ async fn signal_handler(tx: watch::Sender<bool>) {
     println!("Shutting down...");
 }
 
+/// Manages CPU states based on load thresholds and signals asynchronously.
+///
+/// This function performs the following steps:
+/// 1. Enters an infinite loop to continuously monitor and manage CPU states.
+/// 2. Checks if a HUP signal has been received using the `rx` receiver:
+///    - If a HUP signal is received, it prints a message, calls `online_all_cpus` to online all CPUs,
+///      and waits until the HUP signal is cleared.
+/// 3. Calls `update_c0_percentages` to update the C0 state percentages for all CPUs.
+/// 4. Calculates the total and average C0 state percentage for all online CPUs.
+/// 5. Prints the average C0 state percentage and the number of online CPUs.
+/// 6. Compares the average C0 state percentage with the upper and lower thresholds:
+///    - If the average C0 state percentage is above the upper threshold, it attempts to online more CPUs.
+///    - If the average C0 state percentage is below the lower threshold, it attempts to offline some CPUs.
+///    - If the average C0 state percentage is within the thresholds, it prints a message indicating no action is needed.
+/// 7. Sleeps for 1 second before repeating the loop.
+///
+/// # Arguments
+/// * `args` - A reference to the `Args` struct containing the command-line arguments.
+/// * `topology` - A mutable reference to the `SystemTopology` struct representing the system's CPU topology.
+/// * `rx` - A `watch::Receiver<bool>` used to receive signals indicating a HUP signal.
 async fn cpu_manager(
     args: &Args,
     topology: &mut SystemTopology,
@@ -422,6 +553,22 @@ async fn cpu_manager(
     }
 }
 
+/// The main entry point for the CPU manager program.
+///
+/// This function performs the following steps:
+/// 1. Parses command-line arguments using the `clap` crate.
+/// 2. Prints the starting message and the upper and lower load thresholds.
+/// 3. Calls `online_all_cpus` to ensure all CPUs are online at the start.
+/// 4. Initializes the system topology by creating a new `SystemTopology` instance and prints a summary of the system topology.
+/// 5. Creates a `watch` channel for signal handling.
+/// 6. Spawns two asynchronous tasks:
+///    - `main_task`: Runs the `cpu_manager` function to manage CPU states based on load thresholds.
+///    - `signal_task`: Runs the `signal_handler` function to handle UNIX signals.
+/// 7. Uses `tokio::select!` to wait for either the `main_task` or `signal_task` to complete.
+/// 8. Prints a message indicating which task completed and returns `Ok(())`.
+///
+/// # Returns
+/// * `Result<(), Box<dyn std::error::Error>>` - Returns `Ok(())` if successful, or an error if an error occurs.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
