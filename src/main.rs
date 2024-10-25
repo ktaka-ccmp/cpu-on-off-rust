@@ -296,10 +296,15 @@ impl SystemTopology {
             let siblings = &cpu.thread_siblings;
             siblings
                 .iter()
+                // Reference handling in the following filter:
+                // 1. siblings.iter() gives &usize
+                // 2. Filter closure gets another reference, so &&usize
+                // 3. &&sibling_id pattern gives us plain usize (the actual number)
+                // 4. Then we need & for get()
                 .filter(|&&sibling_id| {
                     self.cpus
                         .get(&sibling_id)
-                        .map_or(false, |sibling| sibling.online)
+                        .map_or(false, |cpu| cpu.online)
                 })
                 .copied()
                 .collect()
@@ -338,7 +343,7 @@ impl SystemTopology {
                     .filter(|&&sibling_id| {
                         self.cpus
                             .get(&sibling_id)
-                            .map_or(false, |sibling| !sibling.online)
+                            .map_or(false, |cpu| !cpu.online)
                     })
                     .copied()
                     .collect()
